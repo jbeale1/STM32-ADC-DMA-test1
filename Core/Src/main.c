@@ -6,6 +6,12 @@
 
   * 4x ovrsamp ADC @ 6.5 clocks of 32 MHz => 1.2308 MHz eff. sample rate, 307.7 Hz @ 4k buff
   * actual: 105.36 Hz
+  * 263.6 Hz at 80 MHz ADC clock
+  *
+  * https://www.st.com/resource/en/datasheet/stm32l432kc.pdf
+  * STM32L432KC datasheet p.117/156: not all ADC inputs have the same speed!
+      3. Fast channels are: PC0, PC1, PC2, PC3, PA0, PA1.
+      4. Slow channels are: all ADC inputs except the fast channels.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -42,25 +48,27 @@ DMA_HandleTypeDef hdma_adc1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-#define ADC_BUFFER_SIZE 4000 // was 20k
+#define ADC_BUFFER_SIZE 8000 // was 20k
 uint16_t adc_buffer[ADC_BUFFER_SIZE];  // DMA writes ADC data into this buffer
 // uint16_t tBuf[ADC_BUFFER_SIZE/2];       // working buffer for operation & printout
 
 uint32_t counter = 0;
-uint32_t tick=0;      // geiger counter "count"
+uint16_t tick=0;      // geiger counter "count"
 uint32_t lastTick=0;
+uint16_t lastValue = 0;              // 2nd previous ADC sample, for rising-edge detect
+uint16_t last2Value = 0;              // 2nd previous ADC sample, for rising-edge detect
 
-int32_t sMax = 0;
-int32_t sMin = 65535;
+int16_t sMax = 0;
+int16_t sMin = 65535;
 
-int32_t sMaxT = 0;  // peak ADC value ever seen
-int32_t sMinT = 65535;  // min ADC value ever seen
-int32_t sMaxTP = 0;
-uint32_t cps = 0;    // counts per second
+//int16_t sMaxT = 0;  // peak ADC value ever seen
+//int16_t sMinT = 65535;  // min ADC value ever seen
+int16_t sMaxTP = 0;
+uint16_t cps = 0;    // counts per second
 uint32_t cpsLast = 0;
 
-float avgMin = 360.0;  // 64 for no oversamp, 360 @ 4x
-float avgMinFilt = 0.01;
+float avgVal = 53;  // 53 as of 6-Dec-2023 (4x ovrsamp)
+float avgValFilt = 0.001;
 
 
 /* USER CODE END PV */
@@ -90,8 +98,6 @@ PUTCHAR_PROTOTYPE
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 int readingCount = 0;            // how many sets of ADC readings done
-int lastValue = 0;               // previous ADC sample, for rising-edge detect
-int last2Value = 0;              // 2nd previous ADC sample, for rising-edge detect
 volatile int buf1Ready = false;  // Ping buffer is ready
 volatile int buf2Ready = false;  // Pong buffer is ready
 
@@ -117,29 +123,37 @@ void procBuf(int bIndex) {
     }
 
     // int pThreshold = (132-avgMin);         // ADC thresh for rising edge (no oversamp)
-    int pThreshold = (510-avgMin);            // ADC thresh for rising edge (8x oversamp, <1 bitshft)
+    // int pThreshold = (510-avgMin);            // ADC thresh for rising edge (8x oversamp, <1 bitshft)
 	sMax = 0;
 	sMin = 65535;
+	uint16_t x = 0;
+	int xT = 0;
+
+	uint16_t xTh = avgVal + 37;  // threshold for valid count
+	uint16_t tickOrig = tick;  // remember old value of tick counter
 
     for (int i = idxStart; i < idxEnd; i++) {
-      uint32_t x = adc_buffer[i];
-      uint32_t xTest = x - avgMin;
-      if ((lastValue < pThreshold) && (last2Value < pThreshold) && (xTest > pThreshold)) {
-    	  tick++;
-      }
+      x = adc_buffer[i];
+      //uint16_t xTest = x-avgMin;
+      //if ((lastValue < pThreshold) && (last2Value < pThreshold) && (xTest > pThreshold)) {tick++;}
+      xT = x - 440;
+      if (xT < 0) xT=0;
+      if ((xT > xTh) && (lastValue < xTh) && (last2Value < xTh)) tick++;
       if (x > sMax) sMax = x;
       if (x < sMin) sMin = x;
       last2Value = lastValue;
-      lastValue = xTest;			// remember current value for next time
+      lastValue = xT;			// remember current value for next time
     }
-    avgMin = (avgMin * (1.0-avgMinFilt)) + sMin*avgMinFilt;
+    if (tickOrig == tick) { // no new pulses found in this entire buffer section
+    	avgVal = (avgVal * (1.0-avgValFilt)) + (sMax-440) * avgValFilt;
+    }
 	counter++;
 
-	sMaxTP = sMax - (int)avgMin;
-	sMaxTP = (sMaxTP/4 - 20);
+	sMaxTP = (sMax - 440);
 	if (sMaxTP < 0) sMaxTP = 0;
-	if (sMaxTP > 7) cps++;        // above threshold counts as a hit
-
+	//if (sMaxTP > 12) cps++;        // above threshold counts as a hit
+	//printf("%04d,%d\n",sMaxTP,tick);
+	//printf("%04d,%04d,%d\n",sMaxTP,(int)avgVal,tick);  // about 248 sps
 }
 
 
@@ -194,8 +208,8 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    sMaxT = 0;  // peak ADC value ever seen
-	sMinT = 65535;  // min ADC value ever seen
+    //sMaxT = 0;  // peak ADC value ever seen
+	//sMinT = 65535;  // min ADC value ever seen
 
 	while (!buf1Ready);
 	buf1Ready = false;
@@ -207,9 +221,10 @@ int main(void)
 	procBuf(2); // process second half ("pong") of buffer
 	//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
 
-	if (counter > (209 * 60 )) {               // report CPM each minute
-	//if (counter > (209 )) {               // report CPS each second
-		printf("%ld\n", tick);
+	const int16_t loopSec = 224;                  // half-buffer-loops per second
+	if (counter > (loopSec * 60 )) {               // report CPM each minute
+	//if (counter > (loopSec )) {               // report CPS each second
+		printf("%d\n", tick);
 		counter = 0;
 		lastTick = tick;
 		tick=0;
@@ -316,9 +331,9 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_6CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
