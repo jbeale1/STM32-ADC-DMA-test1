@@ -5,8 +5,11 @@
   * @brief          : ADC DMA readings on Nucleo STM32 L432KC, count signal peaks
 
   * 4x ovrsamp ADC @ 6.5 clocks of 32 MHz => 1.2308 MHz eff. sample rate, 307.7 Hz @ 4k buff
-  * actual: 105.36 Hz
-  * 263.6 Hz at 80 MHz ADC clock
+  * 166.92 Hz pulse rate x 8000 samples => 1.335Msps on DMA channel  (12/9/2023 jpb)
+  *
+  * DMA half,full @ 8k buff: 3ms high, 3ms low f=166.8 Hz  TDS-210 scope
+  * each 8k buffer proc in 6 msec, make sure to use -Ofast flag to C++ compiler.
+  * 80 MHz ADC clock
   *
   * https://www.st.com/resource/en/datasheet/stm32l432kc.pdf
   * STM32L432KC datasheet p.117/156: not all ADC inputs have the same speed!
@@ -49,25 +52,27 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 #define ADC_BUFFER_SIZE 8000 // was 20k
+#define SPEC_SIZE 512
+#define PROC_BUF_SIZE (ADC_BUFFER_SIZE/2)
 uint16_t adc_buffer[ADC_BUFFER_SIZE];  // DMA writes ADC data into this buffer
+
+uint32_t specOut[SPEC_SIZE];
+uint32_t pBuf[PROC_BUF_SIZE];
+unsigned int pBp1 = 0;
+unsigned int pBp2 = 2;
+
 // uint16_t tBuf[ADC_BUFFER_SIZE/2];       // working buffer for operation & printout
 
 uint32_t counter = 0;
-uint16_t tick=0;      // geiger counter "count"
+uint32_t tick=0;      // geiger counter "count"
 uint32_t lastTick=0;
-uint16_t lastValue = 0;              // 2nd previous ADC sample, for rising-edge detect
-uint16_t last2Value = 0;              // 2nd previous ADC sample, for rising-edge detect
 
-int16_t sMax = 0;
-int16_t sMin = 65535;
+uint32_t sMax = 0;
+uint32_t sMin = 65535;
 
-//int16_t sMaxT = 0;  // peak ADC value ever seen
-//int16_t sMinT = 65535;  // min ADC value ever seen
-int16_t sMaxTP = 0;
-uint16_t cps = 0;    // counts per second
-uint32_t cpsLast = 0;
+uint32_t sMaxTP = 0;
 
-float avgVal = 53;  // 53 as of 6-Dec-2023 (4x ovrsamp)
+float avgVal = 511;  // 53 as of 6-Dec-2023 (4x ovrsamp)
 float avgValFilt = 0.001;
 
 
@@ -126,34 +131,50 @@ void procBuf(int bIndex) {
     // int pThreshold = (510-avgMin);            // ADC thresh for rising edge (8x oversamp, <1 bitshft)
 	sMax = 0;
 	sMin = 65535;
-	uint16_t x = 0;
-	int xT = 0;
+	uint32_t x = 0;
+	uint32_t tickOrig = tick;  // remember old value of tick counter
+	uint32_t xTh = avgVal + 30;  // was 37 threshold for valid count
 
-	uint16_t xTh = avgVal + 37;  // threshold for valid count
-	uint16_t tickOrig = tick;  // remember old value of tick counter
-
-    for (int i = idxStart; i < idxEnd; i++) {
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET); // GPIO signal flag
+	int j=0;
+    for (int i = idxStart; i < idxEnd; i++) {  // copy over DMA mem into working buffer
       x = adc_buffer[i];
-      //uint16_t xTest = x-avgMin;
-      //if ((lastValue < pThreshold) && (last2Value < pThreshold) && (xTest > pThreshold)) {tick++;}
-      xT = x - 440;
-      if (xT < 0) xT=0;
-      if ((xT > xTh) && (lastValue < xTh) && (last2Value < xTh)) tick++;
+      pBuf[j++]=x;
       if (x > sMax) sMax = x;
-      if (x < sMin) sMin = x;
-      last2Value = lastValue;
-      lastValue = xT;			// remember current value for next time
     }
+
+    for (int i=2; i<PROC_BUF_SIZE-3; i++)
+    {
+      if ((pBuf[i] > xTh) && (pBuf[i-1] < xTh) && (pBuf[i-2] < xTh)) {
+		  tick++;
+		  int e = (pBuf[i] + pBuf[i+1] + pBuf[i+2] + pBuf[i+3]) >> 6; // combine this and next sample as peak val
+		  if (e >= SPEC_SIZE) {
+			  e = (SPEC_SIZE-1);
+		  }
+		  specOut[e]++;
+      }
+
+      j++;  // index into pBuf[]
+    }
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET); // GPIO signal flag
+
     if (tickOrig == tick) { // no new pulses found in this entire buffer section
-    	avgVal = (avgVal * (1.0-avgValFilt)) + (sMax-440) * avgValFilt;
+    	avgVal = (avgVal * (1.0-avgValFilt)) + (sMax) * avgValFilt;
+    //} else if ((tick - tickOrig) > 15) {
     }
+    /* else if (sMax > 1000) {
+        for (int i=0; i<PROC_BUF_SIZE; i++) {
+        	printf("%d,%ld\n", i, pBuf[i]);
+        }
+    }
+    */
 	counter++;
 
-	sMaxTP = (sMax - 440);
-	if (sMaxTP < 0) sMaxTP = 0;
+	//sMaxTP = (sMax - 440);
+	//if (sMaxTP < 0) sMaxTP = 0;
 	//if (sMaxTP > 12) cps++;        // above threshold counts as a hit
 	//printf("%04d,%d\n",sMaxTP,tick);
-	//printf("%04d,%04d,%d\n",sMaxTP,(int)avgVal,tick);  // about 248 sps
+	//printf("%04ld,%04ld,%ld\n",sMax,(uint32_t)avgVal,tick);  // about 248 sps
 }
 
 
@@ -200,8 +221,16 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
+  for (int i=0;i<SPEC_SIZE;i++) {
+	  specOut[i] = 0; // initialize spectrum array
+  }
 
+  //uint32_t msecPeriod = 60000;   // report time period in msec
+  uint32_t msecPeriod = 10000;   // report time period in msec
+
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
+  uint32_t tLast = HAL_GetTick();
+  unsigned int cycle=0;  // how many output cycles so far
   while (1)
   {
     /* USER CODE END WHILE */
@@ -221,15 +250,23 @@ int main(void)
 	procBuf(2); // process second half ("pong") of buffer
 	//HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
 
-	const int16_t loopSec = 224;                  // half-buffer-loops per second
-	if (counter > (loopSec * 60 )) {               // report CPM each minute
+	uint32_t deltaT = HAL_GetTick() - tLast;  // msec since last readout
+	// const int16_t loopSec = 224;                  // half-buffer-loops per second
+	//if (counter > (loopSec * 60 )) {               // report CPM each minute
 	//if (counter > (loopSec )) {               // report CPS each second
-		printf("%d\n", tick);
+	if (deltaT >= msecPeriod) {
+		//printf("%d,%d\n", counter,tick);
+		printf("%d,%ld\n", cycle,tick);
+		cycle++;
 		counter = 0;
+		tLast += msecPeriod;   // aim for one readout every second
 		lastTick = tick;
 		tick=0;
-		cpsLast = cps;
-		cps = 0;
+
+		for (int i=0;i<SPEC_SIZE/2;i++) {
+		  printf("%d,%ld\n", i,specOut[i]);
+		}
+
 	}
 
   }
@@ -433,14 +470,13 @@ static void MX_GPIO_Init(void)
 // Called when first half of buffer is filled
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
   buf1Ready = true;  // Ping buffer is ready
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
-
+  //HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
 }
 
 // Called when buffer is completely filled
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
   buf2Ready = true;  // Pong buffer is ready
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
+  //HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
 
 }
 
