@@ -4,12 +4,14 @@
   * @file           : main.c
   * @brief          : ADC DMA readings on Nucleo STM32 L432KC, count signal peaks
 
-  * 4x ovrsamp ADC @ 6.5 clocks of 32 MHz => 1.2308 MHz eff. sample rate, 307.7 Hz @ 4k buff
+  * 4x ovrsamp ADC @ 6.5 clocks of 32 MHz => 1.2308 MHz eff.rate, 307.7 Hz @ 4k buff
   * 166.92 Hz pulse rate x 8000 samples => 1.335Msps on DMA channel  (12/9/2023 jpb)
   *
   * DMA half,full @ 8k buff: 3ms high, 3ms low f=166.8 Hz  TDS-210 scope
   * each 8k buffer proc in 6 msec, make sure to use -Ofast flag to C++ compiler.
   * 80 MHz ADC clock
+  *
+  * 3.0 ms for 8k buff @ 2x oversampling (2.667 Msps effective rate)  10-Dec-2023
   *
   * https://www.st.com/resource/en/datasheet/stm32l432kc.pdf
   * STM32L432KC datasheet p.117/156: not all ADC inputs have the same speed!
@@ -66,13 +68,14 @@ unsigned int pBp2 = 2;
 uint32_t counter = 0;
 uint32_t tick=0;      // geiger counter "count"
 uint32_t lastTick=0;
+uint32_t totalTicks = 0;  // total number of ticks recorded over entire runtime
 
 uint32_t sMax = 0;
 uint32_t sMin = 65535;
 
 uint32_t sMaxTP = 0;
 
-float avgVal = 511;  // 53 as of 6-Dec-2023 (4x ovrsamp)
+float avgVal = 260;  // 511 as of 6-Dec-2023 (4x ovrsamp)  260 10-Dec-23 (2x ovrsmp)
 float avgValFilt = 0.001;
 
 
@@ -133,7 +136,7 @@ void procBuf(int bIndex) {
 	sMin = 65535;
 	uint32_t x = 0;
 	uint32_t tickOrig = tick;  // remember old value of tick counter
-	uint32_t xTh = avgVal + 30;  // was 37 threshold for valid count
+	uint32_t xTh = avgVal + 15;  // was 37 threshold for valid count
 
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET); // GPIO signal flag
 	int j=0;
@@ -143,15 +146,25 @@ void procBuf(int bIndex) {
       if (x > sMax) sMax = x;
     }
 
-    for (int i=2; i<PROC_BUF_SIZE-3; i++)
+    for (int i=2; i<(PROC_BUF_SIZE-8); i++)
     {
       if ((pBuf[i] > xTh) && (pBuf[i-1] < xTh) && (pBuf[i-2] < xTh)) {
 		  tick++;
-		  int e = (pBuf[i] + pBuf[i+1] + pBuf[i+2] + pBuf[i+3]) >> 6; // combine this and next sample as peak val
+		  int e=0;
+		  for (int j=0;j<8;j++) {
+		    //e += pBuf[i+j]; // add all these samples together
+			uint32_t val = pBuf[i+j];
+			if (val > e) {
+				e = val;
+			}
+		  }
+		  // e = e>>5;
+		  e = e>>3;
 		  if (e >= SPEC_SIZE) {
 			  e = (SPEC_SIZE-1);
 		  }
 		  specOut[e]++;
+		  i+=8;
       }
 
       j++;  // index into pBuf[]
@@ -162,12 +175,14 @@ void procBuf(int bIndex) {
     	avgVal = (avgVal * (1.0-avgValFilt)) + (sMax) * avgValFilt;
     //} else if ((tick - tickOrig) > 15) {
     }
-    /* else if (sMax > 1000) {
+    /*
+     else if ((sMax > 300) && (sMax < 600))
+      {
         for (int i=0; i<PROC_BUF_SIZE; i++) {
         	printf("%d,%ld\n", i, pBuf[i]);
         }
-    }
-    */
+
+     */
 	counter++;
 
 	//sMaxTP = (sMax - 440);
@@ -225,8 +240,8 @@ int main(void)
 	  specOut[i] = 0; // initialize spectrum array
   }
 
-  //uint32_t msecPeriod = 60000;   // report time period in msec
-  uint32_t msecPeriod = 10000;   // report time period in msec
+  uint32_t msecPeriod = 60000;   // report time period in msec
+  //uint32_t msecPeriod = 10000;   // report time period in msec
 
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
   uint32_t tLast = HAL_GetTick();
@@ -256,15 +271,19 @@ int main(void)
 	//if (counter > (loopSec )) {               // report CPS each second
 	if (deltaT >= msecPeriod) {
 		//printf("%d,%d\n", counter,tick);
-		printf("%d,%ld\n", cycle,tick);
 		cycle++;
+		totalTicks += tick;
+		uint32_t tpc = totalTicks / cycle; // ticks per cycle
+		printf("0,0,%d,%ld,%ld,%ld\n", cycle,tick,totalTicks,tpc);
 		counter = 0;
 		tLast += msecPeriod;   // aim for one readout every second
 		lastTick = tick;
 		tick=0;
-
-		for (int i=0;i<SPEC_SIZE/2;i++) {
-		  printf("%d,%ld\n", i,specOut[i]);
+		if (cycle%10 == 0) {
+			printf("# == energy spectrum == cycle:%d  counts:%ld\n", cycle,totalTicks);
+			for (int i=0;i<SPEC_SIZE/2;i++) {
+			  printf("%d,%ld\n", i,specOut[i]);
+			}
 		}
 
 	}
@@ -357,7 +376,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.OversamplingMode = ENABLE;
-  hadc1.Init.Oversampling.Ratio = ADC_OVERSAMPLING_RATIO_4;
+  hadc1.Init.Oversampling.Ratio = ADC_OVERSAMPLING_RATIO_2;
   hadc1.Init.Oversampling.RightBitShift = ADC_RIGHTBITSHIFT_NONE;
   hadc1.Init.Oversampling.TriggeredMode = ADC_TRIGGEREDMODE_SINGLE_TRIGGER;
   hadc1.Init.Oversampling.OversamplingStopReset = ADC_REGOVERSAMPLING_CONTINUED_MODE;
