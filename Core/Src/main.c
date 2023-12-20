@@ -154,7 +154,7 @@ void procBuf(int bIndex) {
 		  for (int j=0;j<8;j++) {
 		    //e += pBuf[i+j]; // add all these samples together
 			uint32_t val = pBuf[i+j];
-			if (val > e) {
+			if (val > e) { // find peak value
 				e = val;
 			}
 		  }
@@ -274,7 +274,10 @@ int main(void)
 		cycle++;
 		totalTicks += tick;
 		uint32_t tpc = totalTicks / cycle; // ticks per cycle
-		printf("0,0,%d,%ld,%ld,%ld\n", cycle,tick,totalTicks,tpc);
+		uint32_t p34 = specOut[34];  // peak from noise near threshold?
+		int p=46;
+		uint32_t p47 = specOut[p] + specOut[p+1] + specOut[p+2] + specOut[p+3];  // "real" peak at channel 47
+		printf("0,0,%d,%ld,%ld,%ld,%ld,%ld\n", cycle,tick,p34,p47,totalTicks,tpc);
 		counter = 0;
 		tLast += msecPeriod;   // aim for one readout every second
 		lastTick = tick;
@@ -284,6 +287,7 @@ int main(void)
 			for (int i=0;i<SPEC_SIZE/2;i++) {
 			  printf("%d,%ld\n", i,specOut[i]);
 			}
+			printf("# ---\n# cycle,tick,p34,p47,totalTicks,tpc\n"); // column header
 		}
 
 	}
